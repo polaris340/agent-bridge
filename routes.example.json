@@ -1,0 +1,27 @@
+{
+  "projects": {
+    "노트": "~/Documents/notes"
+  },
+  "routes": [
+    {
+      "key": "codex:my-game",
+      "channelId": "이 채널은 codex 로, my-game 폴더에서",
+      "agent": "codex",
+      "cwd": "~/workspace/my-game"
+    },
+    {
+      "key": "claude:workspace",
+      "agent": "claude",
+      "cwd": "~/workspace",
+      "comment": "channelId 를 안 적으면 그 밖의 모든 채널·스레드가 이 라우트를 쓴다"
+    },
+    {
+      "key": "claude:one-room",
+      "channelId": "채널·스레드를 한 세션으로 묶고 싶은 채널 ID",
+      "agent": "claude",
+      "cwd": "~/workspace",
+      "perChannel": false,
+      "perThread": false
+    }
+  ]
+}
