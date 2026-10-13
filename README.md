@@ -284,8 +284,8 @@ route's `command` (`"codex --yolo"`). If the path has spaces, use an array
 (`["/My Tools/codex", "--yolo"]`).
 
 **Restarting the bot doesn't stop the agents in tmux.** The new bot attaches to the
-running panes, and answers that finished in between are posted as "finished late"
-(`⌛ 늦게 끝났다`). Answers that finish in the few seconds the bot is down are missed;
+running panes, and answers that finished in between are still posted to the channel.
+Answers that finish in the few seconds the bot is down are missed;
 check those with `!pane` or `tmux attach`.
 
 ### Limits of the generic adapter
