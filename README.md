@@ -151,6 +151,9 @@ tools/restart.sh          # stop and start again (warns about panes that are mid
 tail -f agent-bridge.log  # log (change the location with AGENT_BRIDGE_LOG)
 ```
 
+Restarting the bot doesn't stop the agents or lose their conversations; the new bot
+picks up the running tmux sessions.
+
 🔴 **On macOS, start it from a terminal.** If you auto-start it at login with launchd,
 macOS blocks the resulting tmux panes from `~/Documents` (EPERM, refused without
 asking). If your work folders live there, it won't work as is. To auto-start, grant
@@ -282,12 +285,6 @@ may have a different PATH from your terminal. Some terminals (cmux, for example)
 tool-approval prompt appears, the turn stops there, so put the flags you need in the
 route's `command` (`"codex --yolo"`). If the path has spaces, use an array
 (`["/My Tools/codex", "--yolo"]`).
-
-**Restarting the bot doesn't stop the agents in tmux.** The new bot attaches to the
-running panes, and answers that finished in between are still posted to the channel.
-Answers that finish in the few seconds the bot is down are missed;
-check those with `!pane` or `tmux attach`.
-
 ### Limits of the generic adapter
 
 TUIs without a log format are judged complete when the screen goes quiet.
