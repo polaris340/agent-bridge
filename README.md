@@ -1,318 +1,344 @@
 # agent-bridge
 
-> 📢 **고지**: 이 저장소의 코드와 문서는 전부 Claude(Anthropic 의 AI)가 작성했고,
-> 사람이 검토하지 않았다. 동작·보안을 보증하지 않는다. 직접 읽어 보고 자기 책임으로
-> 써라 ([MIT 라이선스](LICENSE), 보증 없음).
+> 📢 **Disclaimer**: This project was written with Claude (Anthropic's AI). It has been
+> confirmed to work in real use, but **the code has not been reviewed by a human.**
+> Read it yourself before running it, and use it at your own risk
+> ([MIT License](LICENSE), no warranty).
 
-채팅에 쓴 글을 **tmux 에 상주하는 CLI 코딩 에이전트**로 넣고, 그 턴이 끝나면 답변을
-채팅으로 돌려주는 브리지. 에이전트도 커넥터도 갈아끼울 수 있다.
+A bridge that feeds chat messages into **CLI coding agents living in tmux**, then posts
+the agent's answer back to the chat when the turn ends. Both the agents and the chat
+connectors are pluggable.
 
 ```
-디스코드 메시지
-   └─► 라우터 ─┬─► [tmux: codex-my-game]         codex   (계속 살아 있음)
+Discord message
+   └─► router ─┬─► [tmux: codex-my-game]         codex   (stays alive)
                ├─► [tmux: claude-my-app-5122]   claude
                └─► [tmux: claude-workspace-8801] claude
                         │
-             완료 감지 (어댑터가 정한다)
+             completion detection (per adapter)
                         ▼
-                 디스코드로 답장
+                 reply on Discord
 ```
 
-에이전트를 "띄우고 / 프롬프트를 넣고 / 턴이 끝날 때까지 기다리는" 절차는 공통이고,
-**완료를 어떻게 아는지만** 어댑터가 정한다.
+Launching an agent, typing the prompt, and waiting for the turn to end is the same for
+every agent. **Only how completion is detected** differs, and that is up to the adapter.
 
-> ⚠️ **보안**: 부를 수 있는 사람은 채팅 메시지 하나로 이 컴퓨터에서 에이전트가 명령을
-> 실행하게 할 수 있다. `ALLOWED_USER_IDS` 를 반드시 채우고 믿을 수 있는 사람만 넣어라.
-> 처음 세우는 순서는 [SETUP_FOR_CLAUDE.md](SETUP_FOR_CLAUDE.md) 에 있다.
+> ⚠️ **Security**: anyone allowed to talk to the bot can make an agent run commands on
+> this machine with a single chat message. Always set `ALLOWED_USER_IDS` and list only
+> people you trust. First-time setup steps are in
+> [SETUP_FOR_CLAUDE.md](SETUP_FOR_CLAUDE.md) (Korean).
 
-## 붙어 있는 에이전트
+> ℹ️ The bot's chat messages, logs, code comments and the setup guide are currently in
+> Korean.
 
-| 에이전트 | 완료 감지 | 정확도 |
+## Supported agents
+
+| Agent | Completion detection | Accuracy |
 | --- | --- | --- |
-| `codex` | rollout jsonl 의 `task_complete`. 답변 전문이 이벤트에 들어 있다 | 정확 |
-| `claude` | 세션 jsonl 이 `text` 로 끝난 뒤 조용해지면 완료 | 정확 |
-| 그 밖의 아무 CLI | 화면이 조용해지면 완료 (`generic`) | 근사치 |
+| `codex` | `task_complete` in the rollout jsonl. The full answer is in the event | exact |
+| `claude` | the session jsonl ends with `text` and then goes quiet | exact |
+| `sonnet` | same as `claude` (Claude Code launched with `--model sonnet`) | exact |
+| any other CLI | the screen goes quiet (`generic`) | approximate |
 
-모르는 이름을 쓰면 그 이름을 실행 파일로 삼아 `generic` 으로 붙는다.
-`opencode`, `aider`, `gemini` 같은 것들이 여기 해당한다.
+`sonnet` is a variant of `claude`: it shares the same tmux session name and conversation
+history, so switching between them with `!agent claude` / `!agent sonnet` keeps the
+conversation going and only changes the model.
 
-### 왜 화면을 긁지 않는가
+If a route names an agent without an adapter, that name is run as an executable and
+attached with `generic` — e.g. `opencode`, `aider`, `gemini`.
 
-codex 는 TUI 세션도 `$CODEX_HOME/sessions/**/rollout-*.jsonl` 에 기록하고, 그 안에
-`task_complete` 이벤트가 있다. `last_agent_message` 에 최종 답변 **전문**이 들어
-있어서 완료 시점도 본문도 추측할 필요가 없다.
+### Why not scrape the screen
 
-claude 는 그런 종료 이벤트가 없다. 최종 응답까지 전부 `stop_reason:"tool_use"` 로
-찍힌다. 대신 세션 jsonl 의 모양으로 경계를 잡는다.
+codex records even TUI sessions to `$CODEX_HOME/sessions/**/rollout-*.jsonl`, and that
+file contains a `task_complete` event whose `last_agent_message` holds the **entire**
+final answer. Nothing has to be guessed — neither when the turn ended nor what was said.
 
-- **턴 시작** : `type:"user"` 이면서 `message.content` 가 문자열
-  (도구 결과는 content 가 배열이라 사람이 친 입력과 구분된다)
-- **턴 종료** : 마지막 assistant 가 `text` 를 냈고 뒤따르는 `tool_use` 가 없는
-  상태로 파일이 `IDLE_MS` 동안 조용하면 완료
+claude has no such end event; every message up to the final one is logged with
+`stop_reason:"tool_use"`. Instead, turn boundaries are read from the shape of the
+session jsonl:
 
-**`tool_use` 로 끝난 상태에서는 아무리 오래 조용해도 완료로 보지 않는다.** 도구가
-오래 걸릴 때 답을 반쪽으로 끊어 보내는 오탐을 막는 장치다.
+- **Turn start**: `type:"user"` with a string `message.content`
+  (tool results have an array content, which separates them from human input)
+- **Turn end**: the last assistant message produced `text`, no `tool_use` follows it,
+  and the file stays quiet for `IDLE_MS`
 
-화면(`capture-pane`)은 `!pane`, 실패 진단, 그리고 "입력창이 떴는지" 확인에만 쓴다.
+**A turn that ends in `tool_use` is never treated as complete, no matter how long it is
+quiet.** This prevents sending half an answer while a slow tool is still running.
 
-### 남의 세션과 섞이지 않게
+The screen (`capture-pane`) is only used for `!pane`, failure diagnostics, and checking
+whether the input box has appeared.
 
-같은 폴더에서 사람이 직접 에이전트를 돌리면 로그가 섞인다. claude 는 한 폴더에
-세션 파일이 수십 개씩 쌓여서 "가장 최근 파일" 로 고르면 남의 대화를 읽는다.
+### Not mixing up other people's sessions
 
-- **claude** : 봇이 UUID 를 정해 `--session-id` 로 띄우고 그 파일만 본다
-- **codex** : 새 세션의 id 를 지정하는 옵션이 없다. 대신 띄운 시각 이후에 시작된
-  세션을 한 번 잡은 뒤 그 `session_id` 를 기억하고, 그 뒤로는 그 세션만 본다
+If someone runs an agent by hand in the same folder, the logs get mixed. claude piles up
+dozens of session files per folder, so picking "the newest file" can read someone
+else's conversation.
 
-어느 쪽이든 결과는 같다. 봇은 자기가 띄운 세션만 읽는다. 인스턴스 정보는 `.spool/`
-에 남기므로 봇만 재시작해도 tmux 안의 에이전트를 이어 쓴다.
+- **claude**: the bot picks a UUID, launches with `--session-id`, and reads only that file
+- **codex**: there is no option to set a new session's id. The bot grabs the first
+  session that started after it launched codex, remembers its `session_id`, and from
+  then on reads only that session
 
-## 준비
+Either way, the bot reads only the sessions it launched. Instance info is stored in
+`.spool/`, so restarting just the bot keeps using the agents already running in tmux.
 
-### 1. 디스코드 봇 만들기
+## Setup
+
+### 1. Create a Discord bot
 
 1. https://discord.com/developers/applications → **New Application**
-2. 좌측 **Bot** → **Reset Token** → 토큰 복사 (`.env` 의 `DISCORD_TOKEN`)
-3. 같은 화면에서 **MESSAGE CONTENT INTENT** 를 **켠다**. 이게 꺼져 있으면 메시지
-   본문이 빈 문자열로 와서 봇이 아무 반응도 안 한다
-4. 개인 도구라면 **Public Bot** 은 꺼 둔다. 끄려면 Installation 탭의 설치 링크를
-   먼저 `None` 으로 바꿔야 한다
-5. 좌측 **OAuth2 → URL Generator** 에서 Scopes `bot`, 권한은 `View Channel`,
+2. **Bot** in the sidebar → **Reset Token** → copy the token (`DISCORD_TOKEN` in `.env`)
+3. On the same page, **turn on MESSAGE CONTENT INTENT**. If it is off, message bodies
+   arrive as empty strings and the bot never reacts
+4. For a personal tool, turn **Public Bot** off. To do that, first set the install link
+   on the Installation tab to `None`
+5. **OAuth2 → URL Generator**: scope `bot`, permissions `View Channel`,
    `Send Messages`, `Send Messages in Threads`, `Read Message History`,
-   `Attach Files`, `Add Reactions`. 만들어진 URL 로 내 서버에 초대
+   `Attach Files`, `Add Reactions`. Invite the bot to your server with the generated URL
 
-### 2. 설정
+### 2. Configure
 
 ```sh
 cp .env.example .env
-$EDITOR .env          # DISCORD_TOKEN 은 필수
+$EDITOR .env          # DISCORD_TOKEN is required
 npm install
-npm run doctor        # 실행파일·폴더·tmux·로그 파서까지 점검
+npm run doctor        # checks executables, folders, tmux, and the log parsers
 ```
 
-허용 범위(채널·서버·사람)가 정해지지 않은 라우트가 하나라도 있으면 봇은 뜨지 않는다.
-채팅에 쓴 글이 곧 에이전트에 대한 지시가 되므로, 범위를 좁게 두는 게 실질적인 방어선이다.
-서버 단위로 열더라도 `ALLOWED_USER_IDS` 는 채워 두는 게 좋다.
+The bot refuses to start if any route has no allowed scope (channel, server, or user).
+Whatever is typed in chat becomes an instruction to the agent, so keeping the scope
+narrow is the real line of defense. Even when opening a whole server, fill in
+`ALLOWED_USER_IDS`.
 
-| 설정 | 뜻 |
+| Setting | Meaning |
 | --- | --- |
-| `ALLOWED_GUILD_IDS` | 이 서버 안이면 어느 채널에서든 쓸 수 있다 |
-| `ALLOWED_CHANNEL_IDS` | 이 채널들은 따로 라우트를 갖는다 (고정 세션) |
-| `ALLOWED_USER_IDS` | 부를 수 있는 사람. 비우면 위 범위의 모든 사람 |
-| `AGENT` / `AGENT_CWD` | 위 채널들이 쓸 에이전트와 폴더 |
-| `NEW_SESSION_AGENT` / `NEW_SESSION_CWD` | 그 밖의 채널·스레드가 쓸 에이전트와 폴더 |
-| `PROJECT_ROOTS` | `!project` 로 고를 수 있는 폴더의 루트 (하위를 자동 등록) |
-| `REQUIRE_MENTION` | 멘션한 글에만 반응 (기본 켜짐) |
-| `STREAM_PROGRESS` | 작업 도중 설명도 채널로 보낸다 (기본 켜짐) |
-| `TURN_TIMEOUT_MS` | 한 턴의 제한. `0` 이면 무제한 (기본) |
-| `THREAD_IDLE_MS` | 이만큼 조용하면 tmux 를 내린다 (기본 30분, `.env.example` 은 6시간) |
-| `CLAUDE_REMOTE_CONTROL` | `true` 면 claude 세션을 Remote Control 로도 연다 (기본 꺼짐) |
+| `ALLOWED_GUILD_IDS` | any channel in these servers can use the bot |
+| `ALLOWED_CHANNEL_IDS` | these channels get their own route (a pinned session) |
+| `ALLOWED_USER_IDS` | who may call the bot. Empty means everyone in the scopes above |
+| `AGENT` / `AGENT_CWD` | agent and folder for the channels above |
+| `NEW_SESSION_AGENT` / `NEW_SESSION_CWD` | agent and folder for every other channel/thread |
+| `PROJECT_ROOTS` | roots of the folders selectable with `!project` (subfolders are registered automatically) |
+| `REQUIRE_MENTION` | only react to messages that mention the bot (default on) |
+| `STREAM_PROGRESS` | also post the agent's mid-turn commentary (default on) |
+| `TURN_TIMEOUT_MS` | per-turn limit. `0` means unlimited (default) |
+| `THREAD_IDLE_MS` | shut down tmux after this much quiet (default 30 min; `.env.example` uses 6 h) |
+| `CLAUDE_REMOTE_CONTROL` | `true` also opens claude sessions to Remote Control (default off) |
 
-채널마다 에이전트·폴더를 아예 다르게 두려면 `routes.json` 을 만든다
-(`routes.example.json` 참고). 그 파일이 있으면 위 라우트 설정은 무시된다.
+To give each channel a completely different agent/folder, create `routes.json`
+(see `routes.example.json`). If that file exists, the route settings above are ignored.
 
-## 실행
+## Running
 
 ```sh
-npm start                                          # 봇 상주
-npm run doctor                                     # 설정 점검
-npm test                                           # 라우팅 규칙 검증
-npm run selftest                                   # 커넥터 없이 왕복 한 번
-npm run selftest -- --agent claude --cwd /path "안녕"
+npm start                                          # run the bot
+npm run doctor                                     # check the configuration
+npm test                                           # run the tests
+npm run selftest                                   # one round trip without a connector
+npm run selftest -- --agent claude --cwd /path "hello"
 ```
 
-에이전트가 도는 tmux 세션은 직접 볼 수 있다.
+You can look at the tmux sessions the agents run in directly.
 
 ```sh
 tmux ls
-tmux attach -t claude-my-app-5122     # 빠져나올 땐 Ctrl-b d
+tmux attach -t claude-my-app-5122     # detach with Ctrl-b d
 ```
 
-### 다시 띄우기
+### Restarting
 
 ```sh
-tools/restart.sh          # 내리고 다시 띄운다 (작업 중인 판은 미리 알려준다)
-tail -f agent-bridge.log  # 로그 (AGENT_BRIDGE_LOG 로 위치를 바꿀 수 있다)
+tools/restart.sh          # stop and start again (warns about panes that are mid-turn)
+tail -f agent-bridge.log  # log (change the location with AGENT_BRIDGE_LOG)
 ```
 
-🔴 **macOS 에서는 터미널에서 띄운다.** launchd 로 로그인할 때 자동으로 뜨게 하면, 그렇게
-띄운 tmux 판은 맥이 `~/Documents` 접근을 막는다(EPERM, 묻지도 않고 거부). 작업 폴더가
-거기 있으면 그대로는 못 쓴다. 자동 시작을 붙이려면 tmux 에 전체 디스크 접근 권한을
-먼저 줘야 한다.
+🔴 **On macOS, start it from a terminal.** If you auto-start it at login with launchd,
+macOS blocks the resulting tmux panes from `~/Documents` (EPERM, refused without
+asking). If your work folders live there, it won't work as is. To auto-start, grant
+tmux Full Disk Access first.
 
-**봇은 한 번에 하나만 돌려라.** 둘이 동시에 돌면 같은 tmux 세션에 각자 키를 밀어
-넣어서 셸 한 줄에 실행 명령이 두 번 겹쳐 들어가고, 그 뒤 채팅에 쓴 글이 에이전트가
-아니라 셸로 떨어진다. `.spool/bot.lock` 으로 막아 두었다.
+**Run only one bot at a time.** Two bots push keys into the same tmux session: the
+launch command gets typed twice on one shell line, and after that chat messages land in
+the shell instead of the agent. `.spool/bot.lock` prevents this.
 
-## 채널에서 쓰는 법
+## Using it in a channel
 
-허용된 곳에서 **봇을 멘션하면** 그 채널의 에이전트로 들어간다
-(`@봇이름 이 파일 좀 봐줘`). 멘션 없는 글은 무시하므로 사람끼리 나누는 대화에
-끼어들지 않는다. 명령도 `@봇이름 !status` 처럼 부른다. DM 은 멘션할 수가 없으니
-그냥 쓰면 된다.
+Where allowed, **mention the bot** and the message goes to that channel's agent
+(`@botname take a look at this file`). Messages without a mention are ignored, so the
+bot stays out of conversations between people. Commands are called the same way:
+`@botname !status`. DMs can't contain mentions, so just type.
 
 ```
-[내 메시지]  👀                     ← 봤다
+[your message]  👀                  ← seen
 
-> 파일 구조부터 확인할게요           ← 작업 도중의 설명 (인용)
-> 세 군데 고치면 되겠습니다
+> Checking the file layout first     ← mid-turn commentary (quoted)
+> Three places need changes
 
-수정 끝냈습니다. router.js 에서...   ← 최종 답변
-✅                                  ← 여기까지가 이번 턴
+Done. In router.js ...               ← final answer
+✅                                  ← end of this turn
 ```
 
-눈알은 답이 나가기 시작하면 뗀다. 실패하면 눈알을 떼고 사유 한 줄만 남긴다.
+The 👀 is removed once the answer starts going out. On failure it is removed and a
+one-line reason is posted.
 
-**에이전트가 보여주려는 파일은 채널로 올라온다.** claude 는 SendUserFile 로 보내겠다고
-지목한 것을, codex 는 내장 그림 도구로 만든 그림(`generated_images`)을 올린다. 답변에
-경로를 적은 그림·영상·소리도 같이 올린다. 터미널 CLI 에는 채팅으로 파일을 보낼 통로가
-없어서 봇이 대신 올려 주는 것이다.
+**Files the agent wants to show you are uploaded to the channel.** For claude, files it
+sends with SendUserFile; for codex, images made with its built-in image tool
+(`generated_images`). Images, videos and audio whose paths appear in the answer are
+uploaded too. Terminal CLIs have no way to send files to a chat, so the bot does it for
+them.
 
-올리는 자리는 좁게 둔다. 작업 폴더, `/tmp`, 에이전트가 그림을 두는 자리 안의 파일만
-올리고, 링크는 끝까지 풀어서 실제 위치로 따진다. 그 안이라도 점으로 시작하는 파일
-(`.env` …)과 `.ssh` `.git` `.aws` 같은 폴더 아래는 올리지 않는다. 에이전트는 읽은 문서
-속 지시에 넘어갈 수 있어서, "이 파일 보내" 를 그대로 믿지 않는다.
+Upload locations are kept narrow. Only files inside the work folder, `/tmp`, and the
+agent's own image folder are uploaded, and symlinks are resolved to their real
+location before checking. Even inside those, dotfiles (`.env` …) and anything under
+folders like `.ssh`, `.git`, `.aws` are never uploaded. Agents can be fooled by
+instructions hidden in documents they read, so "send this file" is not taken at face
+value.
 
-**파일과 이미지도 붙여 보낼 수 있다.** 받아서 `.spool/files/` 에 두고 그 경로를
-프롬프트에 실어 보낸다. 에이전트가 알아서 읽는다. 글 없이 파일만 던져도 된다.
-받아 둔 파일은 하루 지나면 치운다.
+**You can attach files and images too.** They are saved to `.spool/files/` and the
+path is passed along in the prompt; the agent reads them itself. A file with no text is
+fine. Saved files are cleaned up after a day.
 
-**답을 기다리는 중에도 그냥 보내면 된다.** 에이전트가 작업 중에 들어온 입력을 알아서
-반영하므로(steering) 붙잡아 두지 않는다. 그렇게 한 턴에 묶인 메시지들은 **답장을 한
-번만** 받는다(마지막 메시지에 달린다). 같은 답이 보낸 횟수만큼 나가지 않게 하려는
-것이다.
+**You can keep sending while waiting for an answer.** Agents pick up input that arrives
+mid-turn (steering), so nothing is held back. Messages folded into one turn get **one
+reply** (attached to the last message), so the same answer isn't posted once per
+message.
 
-### 채널과 스레드
+### Channels and threads
 
-| 상황 | 어떻게 되나 |
+| Situation | What happens |
 | --- | --- |
-| 서버 안 아무 채널 | 채널마다 세션이 따로 뜬다 |
-| 스레드를 연다 | 스레드마다 세션이 따로 뜬다 |
-| `ALLOWED_CHANNEL_IDS` 에 적은 채널 | 그 라우트의 고정 세션을 쓴다 |
+| any channel in an allowed server | each channel gets its own session |
+| you open a thread | each thread gets its own session |
+| a channel listed in `ALLOWED_CHANNEL_IDS` | uses that route's pinned session |
 
-채널도 스레드도 보통 작업 하나의 단위라 각자 에이전트를 따로 띄운다. 서로 기다리지
-않고 맥락도 안 섞인다. 한 세션으로 묶고 싶으면 라우트에 `"perChannel": false` 나
-`"perThread": false` 를 준다.
+A channel or thread is usually one unit of work, so each gets its own agent. They don't
+wait on each other and their context doesn't mix. To share one session, set
+`"perChannel": false` or `"perThread": false` on the route.
 
-tmux 이름은 `<에이전트>-<폴더>-<채널id 끝 네 자리>` 로 짓는다
-(`claude-my-app-5122`). `tmux ls` 만 보고도 뭐가 어디서 도는지 알 수 있게.
+tmux sessions are named `<agent>-<folder>-<last 4 digits of channel id>`
+(`claude-my-app-5122`), so `tmux ls` alone tells you what is running where.
 
-### 조용해지면 내리고, 다시 부르면 이어간다
+### Shut down when quiet, resume when called
 
-`THREAD_IDLE_MS`(기본 30분) 동안 조용하면 tmux 를 내린다. 안 그러면 채널을 열 때마다
-tmux 세션과 에이전트 프로세스가 쌓이기만 한다.
+After `THREAD_IDLE_MS` (default 30 min) of quiet, the tmux session is shut down.
+Otherwise tmux sessions and agent processes would pile up with every channel you open.
 
-**내려도 하던 얘기는 남는다.** 대화 기록은 에이전트가 자기 폴더에 쌓아 두고, 봇은 그
-세션 id 를 적어 둔다. 다시 말을 걸면 그 대화를 이어서 띄운다
-(`claude --resume <id>` / `codex resume <id> --cd <폴더>`). 이어 붙이기가 실패할
-때만 새로 시작한다.
+**The conversation survives the shutdown.** The agent keeps its history in its own
+folder and the bot records the session id. The next message resumes that conversation
+(`claude --resume <id>` / `codex resume <id> --cd <folder>`). A fresh session is
+started only if resuming fails.
 
-기록까지 버리는 건 폴더를 옮길 때(`!project`)와 `!restart` 뿐이다.
-작업 중인 세션은 내리지 않고, 고정 채널 세션은 자동으로 내리지 않는다.
+History is discarded only when moving folders (`!project`) and on `!restart`.
+Sessions that are mid-turn are never shut down, and pinned channel sessions are never
+shut down automatically.
 
-### 명령
+### Commands
 
-| 명령 | 하는 일 |
+| Command | What it does |
 | --- | --- |
-| `!help` | 도움말 |
-| `!project` (`!cd`) | 쓸 수 있는 폴더 목록 |
-| `!project <이름>` | 이 채널을 그 폴더로 옮긴다. **없는 이름이면 새로 만든다** |
-| `!agent` | 지금 에이전트와 고를 수 있는 이름 |
-| `!agent <이름>` | 에이전트를 바꾼다. 어댑터가 있는 것(`codex` `claude` `sonnet`)과 라우트에 적힌 것만 된다. claude ↔ sonnet 은 대화가 이어진다 |
-| `!status` | 에이전트·폴더·tmux·보고 있는 로그·작업 여부 |
-| `!agents` | 떠 있는 세션 전부 |
-| `!pane` | 지금 화면 마지막 40줄 |
-| `!esc` (`!cancel`) | 진행 중인 턴 중단 |
-| `!restart` | 처음부터 다시 띄운다. **하던 얘기를 버린다** |
+| `!help` | help |
+| `!project` (`!cd`) | list available folders |
+| `!project <name>` | move this channel to that folder. **Creates it if it doesn't exist** |
+| `!agent` | current agent and the names you can pick |
+| `!agent <name>` | switch agent. Only agents with an adapter (`codex` `claude` `sonnet`) and names configured in routes are accepted. claude ↔ sonnet keeps the conversation |
+| `!status` | agent, folder, tmux, watched log, busy or not |
+| `!agents` | every running session |
+| `!pane` | last 40 lines of the screen |
+| `!esc` (`!cancel`) | interrupt the current turn |
+| `!restart` | start over. **Discards the conversation** |
 
-명령은 큐를 거치지 않아 작업 중에도 바로 답한다.
+Commands skip the queue and answer immediately, even mid-turn.
 
-`!project` 로 고를 수 있는 폴더는 `PROJECT_ROOTS` 아래를 훑어 자동 등록하고,
-`PROJECTS` 로 하나씩 더 적을 수 있다. 없는 이름을 부르면 `PROJECT_ROOTS` 의 첫 루트
-아래에 만들고 `git init` 까지 한다. 이름은 영숫자와 `.` `_` `-` 만 받는다.
-경로를 벗어나는 이름을 막기 위한 것이다. 한 번 고른 폴더는 그 채널이 기억하므로
-세션을 내렸다 다시 띄워도 그 폴더에서 뜬다.
+Folders for `!project` are registered by scanning `PROJECT_ROOTS`, and `PROJECTS` adds
+more one by one. An unknown name is created under the first `PROJECT_ROOTS` root and
+`git init`-ed. Names accept only letters, digits, `.`, `_` and `-`, to stop names from
+escaping the root. A channel remembers the folder it picked, so the session comes back
+in that folder after being shut down.
 
-## 알아둘 것
+## Things to know
 
-**입력은 두 군데서 조용히 실패한다.** TUI 가 막 떴을 때는 입력을 아예 못 받고,
-붙여넣기 직후 Enter 는 씹힌다. 그래서 입력창이 실제로 그려진 걸 확인한 뒤에 보내고,
-붙여넣은 게 화면에 보이는지 보고, Enter 는 `ENTER_DELAY_MS` 뒤에 친다. 그래도 턴이
-시작되지 않으면 Enter 를 한 번 더 보낸다.
+**Input silently fails in two places.** A TUI that just launched doesn't accept input
+at all, and an Enter sent right after pasting gets swallowed. So the bot waits until the
+input box is actually drawn, checks that the pasted text shows up on screen, and sends
+Enter after `ENTER_DELAY_MS`. If the turn still doesn't start, it sends Enter once more.
 
-**처음 여는 폴더에서는 에이전트가 신뢰 여부를 먼저 묻는다.** 여기 걸린 줄 모르고
-프롬프트를 밀어 넣으면 그 지시가 통째로 유실된다. 그 화면을 감지해 넘기고 로그에
-남긴다.
+**Agents ask whether to trust a folder the first time they open it.** Pushing a prompt
+into that screen loses it entirely. The bot detects the screen, gets past it, and logs
+that it did.
 
-**줄바꿈이 섞이거나 긴 메시지는 파일로 넘어간다.** tmux 로 줄바꿈을 그대로
-붙여넣으면 TUI 가 중간에서 Enter 로 받아 지시가 토막 난다. 그래서 그런 메시지는
-`.spool/` 에 파일로 쓰고 "이 파일을 읽고 처리해라" 로 바꿔 보낸다. 이 파일들은
-하루 지나면 알아서 치운다.
+**Multi-line or long messages are passed as files.** Pasting newlines through tmux
+makes the TUI treat them as Enter, chopping the instruction up. Such messages are
+written to a file in `.spool/` and replaced with "read this file and do what it says".
+These files are cleaned up after a day.
 
-**턴에 제한 시간이 없다** (`TURN_TIMEOUT_MS=0`). 제한을 걸어 두면 아직 일하고 있는
-에이전트를 실패로 만들 뿐이다. 제한을 걸었더라도, 그 뒤에 늦게 끝난 작업의 답은
-그 채널로 흘려보낸다.
+**Turns have no time limit** (`TURN_TIMEOUT_MS=0`). A limit only turns an agent that is
+still working into a failure. Even with a limit, answers from work that finishes late
+are still posted to the channel.
 
-**PATH 에서 못 찾으면 실행 파일을 실경로로 적어라.** 봇이 띄운 셸의 PATH 가 터미널과
-다를 수 있다. 터미널에 따라서는(cmux 등) `which codex` 가 곧 사라지는 임시 shim 을
-가리키기도 한다.
+**If an executable isn't found on PATH, give its full path.** The shell the bot starts
+may have a different PATH from your terminal. Some terminals (cmux, for example) make
+`which codex` point to a temporary shim that soon disappears.
 
-**승인 모드는 에이전트 쪽 설정을 그대로 따른다.** 봇은 샌드박스를 따로 지정하지
-않는다. 도구 승인 프롬프트가 뜨면 턴이 거기서 멈추므로, 필요하면 라우트의
-`command` 에 해당 플래그를 넣어라 (`"codex --yolo"`). 경로에 띄어쓰기가 있으면
-배열로 적는다 (`["/My Tools/codex", "--yolo"]`).
+**Approval mode follows the agent's own settings.** The bot doesn't set a sandbox. If a
+tool-approval prompt appears, the turn stops there, so put the flags you need in the
+route's `command` (`"codex --yolo"`). If the path has spaces, use an array
+(`["/My Tools/codex", "--yolo"]`).
 
-**봇을 재시작해도 에이전트는 tmux 안에서 계속 돈다.** 다시 뜬 봇이 돌던 판에 붙고, 그
-사이 끝난 답은 `⌛ 늦게 끝났다` 로 올라온다. 다만 봇이 꺼져 있던 몇 초 사이에 끝난
-답은 놓친다. 그럴 땐 `!pane` 이나 `tmux attach` 로 본다.
+**Restarting the bot doesn't stop the agents in tmux.** The new bot attaches to the
+running panes, and answers that finished in between are posted as "finished late"
+(`⌛ 늦게 끝났다`). Answers that finish in the few seconds the bot is down are missed;
+check those with `!pane` or `tmux attach`.
 
-### generic 어댑터의 한계
+### Limits of the generic adapter
 
-로그 규격이 없는 TUI 는 화면이 조용해지는 것으로 완료를 판정한다.
+TUIs without a log format are judged complete when the screen goes quiet.
 
-- **답변에 화면 부스러기가 섞인다.** 상태줄(`Build · 1m 24s`, 토큰 수 등)은 글자가
-  있어서 장식 필터로 걸러지지 않는다
-- **판정이 근사치다.** 에이전트가 오래 뜸을 들이면 그 사이를 완료로 볼 수 있다
+- **Answers include screen debris.** Status lines (`Build · 1m 24s`, token counts and
+  so on) contain text, so the decoration filter doesn't remove them
+- **Detection is approximate.** If the agent pauses for a long time, that pause may be
+  taken as completion
 
-자주 쓰는 에이전트라면 전용 어댑터를 붙이는 게 낫다. 로그를 읽어 완료를 아는 예시는
-`src/agents/codex.js`, 화면만 보는 가장 단순한 예시는 `src/agents/generic.js` 다.
+For an agent you use often, a dedicated adapter is better. `src/agents/codex.js` is an
+example that reads logs to detect completion; `src/agents/generic.js` is the simplest,
+screen-only example.
 
-## 파일
+## Files
 
-| 파일 | 역할 |
+| File | Role |
 | --- | --- |
-| `src/index.js` | 조립. 커넥터에서 온 메시지를 라우터에 넘기고 명령을 처리 |
-| `src/routing.js` | "이 메시지는 어느 세션으로 가는가" 만 정하는 순수 함수 |
-| `src/routing.test.js` | 라우팅 규칙 검증 |
-| `src/router.js` | 채널·스레드를 세션에 붙이고, 조용해진 세션을 내린다 |
-| `src/session.js` | tmux 세션 하나 = 에이전트 하나. 띄우기·주입·턴 대기·이어 붙이기 |
-| `src/tmux.js` | 세션 보장, 키 전송(+입력 확인), pane 캡처 |
-| `src/lock.js` | 봇이 둘 이상 돌지 못하게 |
-| `src/agents/` | 완료를 어떻게 아는지 (codex / claude / generic) |
-| `src/connectors/` | 어디서 말이 오는지 (지금은 discord) |
-| `src/watchers/jsonl-tail.js` | JSONL 세션 로그 tailing (파일 전환·UTF-8 경계 처리) |
-| `src/config.js` | 라우트·프로젝트·허용 범위 |
-| `src/doctor.js` | 설정·실행파일·tmux·로그 파서 점검 |
-| `src/selftest.js` | 커넥터 없이 왕복 1회 |
+| `src/index.js` | wiring. Passes connector messages to the router and handles commands |
+| `src/routing.js` | pure function that only decides which session a message goes to |
+| `src/routing.test.js` | routing rule tests |
+| `src/router.js` | attaches channels/threads to sessions and shuts down quiet ones |
+| `src/session.js` | one tmux session = one agent. Launch, inject, wait for the turn, resume |
+| `src/tmux.js` | ensure sessions, send keys (with input check), capture panes |
+| `src/lock.js` | keeps more than one bot from running |
+| `src/images.js` | decides which files may be uploaded to the chat |
+| `src/agents/` | how completion is detected (codex / claude / generic) |
+| `src/connectors/` | where messages come from (Discord for now) |
+| `src/watchers/jsonl-tail.js` | tails JSONL session logs (file switching, UTF-8 boundaries) |
+| `src/config.js` | routes, projects, allowed scopes |
+| `src/doctor.js` | checks settings, executables, tmux, and log parsers |
+| `src/selftest.js` | one round trip without a connector |
 
-## 커넥터 늘리기
+## Adding a connector
 
-`src/connectors/discord.js` 가 지키는 약속은 이게 전부다.
+This is the whole contract `src/connectors/discord.js` keeps.
 
 ```js
 new Connector({ token, onMessage })
 await connector.start()
-await connector.send(channelId, text)   // 먼저 말 걸 때
+await connector.send(channelId, text, files, { mention })   // to speak first
 await connector.stop()
 
-// onMessage 로 넘기는 것
-// { channelId, parentId, guildId, mentioned, isDirect,
-//   userId, userName, text, reply, react, unreact }
+// what onMessage receives
+// { channelId, parentId, guildId, mentioned, isDirect, attachments,
+//   userId, userName, displayName, text,
+//   reply(text, files, { ping, mention }), react, unreact }
 ```
 
-슬랙이든 텔레그램이든 이 모양만 맞춰 `src/connectors/index.js` 에 등록하면
-나머지(라우팅·세션·에이전트)는 그대로 쓴다.
+Match this shape for Slack, Telegram or anything else, register it in
+`src/connectors/index.js`, and the rest (routing, sessions, agents) works unchanged.
 
-## 라이선스
+## License
 
 [MIT](LICENSE)
